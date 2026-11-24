@@ -23,7 +23,6 @@ func (s *EventService) CreateEvent(ctx context.Context, adminID string, req mode
 	startAt, _ := time.Parse(time.RFC3339, req.StartAt)
 	endAt, _ := time.Parse(time.RFC3339, req.EndAt)
 
-	// Validasi start_at harus di masa depan
 	if startAt.Before(time.Now()) {
 		return nil, errors.New("start_at harus di masa depan")
 	}
@@ -91,7 +90,6 @@ func (s *EventService) UpdateEvent(ctx context.Context, adminID, id string, req 
 		return nil, errors.New("event cancelled tidak bisa diubah")
 	}
 
-	// Optimistic Locking Check
 	if event.Version != req.Version {
 		return nil, errors.New("VERSION_CONFLICT")
 	}
@@ -101,7 +99,6 @@ func (s *EventService) UpdateEvent(ctx context.Context, adminID, id string, req 
 	startAt, _ := time.Parse(time.RFC3339, req.StartAt)
 	endAt, _ := time.Parse(time.RFC3339, req.EndAt)
 
-	// Hitung sisa tiket yang sudah terpakai
 	terpakai := event.Quota - event.Available
 	if req.Quota < terpakai {
 		return nil, errors.New("quota tidak boleh lebih kecil dari tiket terpakai")
@@ -121,7 +118,7 @@ func (s *EventService) UpdateEvent(ctx context.Context, adminID, id string, req 
 		return nil, err
 	}
 
-	event.Version++ // Update versi di memory untuk response
+	event.Version++
 	event.UpdatedAt = time.Now()
 
 	afterJSON, _ := json.Marshal(event)
@@ -175,4 +172,50 @@ func (s *EventService) PublishEvent(ctx context.Context, adminID, id string) (*m
 
 	tx.Commit()
 	return event, nil
+}
+
+func (s *EventService) CancelEvent(ctx context.Context, adminID, id string, req model.CancelEventRequest) (*model.Event, int64, error) {
+	if len(req.Reason) < 5 || len(req.Reason) > 255 {
+		return nil, 0, errors.New("reason wajib, 5-255 karakter")
+	}
+
+	tx, err := s.eventRepo.BeginTx(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer tx.Rollback()
+
+	event, err := s.eventRepo.FindByIDForUpdate(ctx, tx, id)
+	if err != nil {
+		return nil, 0, model.ErrNotFound
+	}
+
+	if event.Status == "cancelled" {
+		return nil, 0, errors.New("INVALID_STATE")
+	}
+
+	beforeJSON, _ := json.Marshal(event)
+
+	// Ubah status event
+	s.eventRepo.UpdateStatus(ctx, tx, id, "cancelled")
+	event.Status = "cancelled"
+	event.Version++
+
+	// Batalkan semua order pending & paid
+	cancelledOrders, err := s.eventRepo.CancelPendingPaidOrders(ctx, tx, id)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	afterJSON, _ := json.Marshal(event)
+	audit := &model.AuditLog{
+		ActorID: &adminID, ActorType: "user", EntityType: "event",
+		EntityID: event.ID, Action: "cancel", Before: beforeJSON, After: afterJSON,
+	}
+	s.eventRepo.InsertAuditLog(ctx, tx, audit)
+
+	if err := tx.Commit(); err != nil {
+		return nil, 0, err
+	}
+	return event, cancelledOrders, nil
 }

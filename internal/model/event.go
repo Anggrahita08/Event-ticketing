@@ -23,8 +23,8 @@ type CreateEventRequest struct {
 	Name        string  `json:"name"`
 	Description string  `json:"description"`
 	Venue       string  `json:"venue"`
-	StartAt     string  `json:"start_at"` // RFC 3339
-	EndAt       string  `json:"end_at"`   // RFC 3339
+	StartAt     string  `json:"start_at"`
+	EndAt       string  `json:"end_at"`
 	Price       float64 `json:"price"`
 	Quota       int     `json:"quota"`
 }

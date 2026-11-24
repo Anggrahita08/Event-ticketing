@@ -65,3 +65,30 @@ func (h *EventHandler) Publish(w http.ResponseWriter, r *http.Request) {
 	}
 	writeSuccess(w, http.StatusOK, "Event berhasil diterbitkan", event, nil)
 }
+
+func (h *EventHandler) Cancel(w http.ResponseWriter, r *http.Request) {
+	adminID, _ := r.Context().Value(middleware.UserContextKey).(string)
+	id := r.PathValue("id")
+	var req model.CancelEventRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Input tidak valid", nil)
+		return
+	}
+
+	event, cancelledOrders, err := h.eventService.CancelEvent(r.Context(), adminID, id, req)
+	if err != nil {
+		if err.Error() == "INVALID_STATE" {
+			writeError(w, http.StatusConflict, "INVALID_STATE", "Event sudah dibatalkan", nil)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), nil)
+		return
+	}
+
+	// Custom response untuk cancel sesuai brief
+	responseData := map[string]interface{}{
+		"event":            event,
+		"cancelled_orders": cancelledOrders,
+	}
+	writeSuccess(w, http.StatusOK, "Event berhasil dibatalkan", responseData, nil)
+}

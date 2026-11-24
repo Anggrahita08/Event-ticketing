@@ -7,13 +7,14 @@ import (
 )
 
 type EventRepository interface {
+	BeginTx(ctx context.Context) (*sql.Tx, error)
 	Create(ctx context.Context, tx *sql.Tx, event *model.Event) error
 	FindByID(ctx context.Context, id string) (*model.Event, error)
 	FindByIDForUpdate(ctx context.Context, tx *sql.Tx, id string) (*model.Event, error)
 	Update(ctx context.Context, tx *sql.Tx, event *model.Event) error
 	UpdateStatus(ctx context.Context, tx *sql.Tx, id string, status string) error
+	CancelPendingPaidOrders(ctx context.Context, tx *sql.Tx, eventID string) (int64, error)
 	InsertAuditLog(ctx context.Context, tx *sql.Tx, log *model.AuditLog) error
-	BeginTx(ctx context.Context) (*sql.Tx, error)
 }
 
 type eventRepository struct {
@@ -37,28 +38,24 @@ func (r *eventRepository) Create(ctx context.Context, tx *sql.Tx, event *model.E
 }
 
 func (r *eventRepository) FindByID(ctx context.Context, id string) (*model.Event, error) {
-	query := `SELECT id, name, description, venue, start_at, end_at, price, quota, available, status, version, created_by, created_at, updated_at FROM events WHERE id = $1`
+	query := `SELECT id, name, COALESCE(description, ''), venue, start_at, end_at, price, quota, available, status, version, created_by, created_at, updated_at FROM events WHERE id = $1`
 	row := r.db.QueryRowContext(ctx, query, id)
 	var e model.Event
-	var desc sql.NullString
-	err := row.Scan(&e.ID, &e.Name, &desc, &e.Venue, &e.StartAt, &e.EndAt, &e.Price, &e.Quota, &e.Available, &e.Status, &e.Version, &e.CreatedBy, &e.CreatedAt, &e.UpdatedAt)
+	err := row.Scan(&e.ID, &e.Name, &e.Description, &e.Venue, &e.StartAt, &e.EndAt, &e.Price, &e.Quota, &e.Available, &e.Status, &e.Version, &e.CreatedBy, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
-	e.Description = desc.String
 	return &e, nil
 }
 
 func (r *eventRepository) FindByIDForUpdate(ctx context.Context, tx *sql.Tx, id string) (*model.Event, error) {
-	query := `SELECT id, name, description, venue, start_at, end_at, price, quota, available, status, version, created_by, created_at, updated_at FROM events WHERE id = $1 FOR UPDATE`
+	query := `SELECT id, name, COALESCE(description, ''), venue, start_at, end_at, price, quota, available, status, version, created_by, created_at, updated_at FROM events WHERE id = $1 FOR UPDATE`
 	row := tx.QueryRowContext(ctx, query, id)
 	var e model.Event
-	var desc sql.NullString
-	err := row.Scan(&e.ID, &e.Name, &desc, &e.Venue, &e.StartAt, &e.EndAt, &e.Price, &e.Quota, &e.Available, &e.Status, &e.Version, &e.CreatedBy, &e.CreatedAt, &e.UpdatedAt)
+	err := row.Scan(&e.ID, &e.Name, &e.Description, &e.Venue, &e.StartAt, &e.EndAt, &e.Price, &e.Quota, &e.Available, &e.Status, &e.Version, &e.CreatedBy, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
-	e.Description = desc.String
 	return &e, nil
 }
 
@@ -72,6 +69,17 @@ func (r *eventRepository) UpdateStatus(ctx context.Context, tx *sql.Tx, id strin
 	query := `UPDATE events SET status=$1, version=version+1, updated_at=NOW() WHERE id=$2`
 	_, err := tx.ExecContext(ctx, query, status, id)
 	return err
+}
+
+func (r *eventRepository) CancelPendingPaidOrders(ctx context.Context, tx *sql.Tx, eventID string) (int64, error) {
+	// Sesuai brief: pembatalan event memindahkan order pending dan paid ke cancelled
+	query := `UPDATE orders SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW() 
+	          WHERE event_id = $1 AND status IN ('pending', 'paid')`
+	res, err := tx.ExecContext(ctx, query, eventID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (r *eventRepository) InsertAuditLog(ctx context.Context, tx *sql.Tx, log *model.AuditLog) error {

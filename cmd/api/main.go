@@ -27,20 +27,20 @@ func main() {
 	defer db.Close()
 	log.Println("Berhasil terhubung ke database")
 
-	// Panggil Seeder Admin
 	repository.SeedAdmin(context.Background(), db, cfg.AdminEmail, cfg.AdminPassword)
 
-	// Dependency Injection
 	userRepo := repository.NewUserRepository(db)
 	eventRepo := repository.NewEventRepository(db)
+	orderRepo := repository.NewOrderRepository(db)
 
 	authService := service.NewAuthService(userRepo, cfg)
 	eventService := service.NewEventService(eventRepo)
+	orderService := service.NewOrderService(orderRepo)
 
 	authHandler := handler.NewAuthHandler(authService)
 	eventHandler := handler.NewEventHandler(eventService)
+	orderHandler := handler.NewOrderHandler(orderService)
 
-	// Setup Router
 	mux := http.NewServeMux()
 
 	// Public Routes
@@ -51,18 +51,28 @@ func main() {
 	})
 	mux.HandleFunc("POST /api/v1/auth/register", authHandler.Register)
 	mux.HandleFunc("POST /api/v1/auth/login", authHandler.Login)
+	mux.HandleFunc("GET /api/v1/events", eventHandler.ListPublic)
+	mux.HandleFunc("GET /api/v1/events/{id}", eventHandler.GetDetail)
 
-	// Customer / Logged in Routes
+	// Auth Routes (Customer/Admin)
 	authMux := http.NewServeMux()
 	authMux.HandleFunc("GET /api/v1/auth/me", authHandler.Me)
 	mux.Handle("/api/v1/auth/me", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "")(authMux))
+
+	// Customer Only Routes
+	customerMux := http.NewServeMux()
+	customerMux.HandleFunc("POST /api/v1/orders", orderHandler.Create)
+	customerMux.HandleFunc("POST /api/v1/orders/{id}/pay", orderHandler.Pay)
+	customerMux.HandleFunc("POST /api/v1/orders/{id}/cancel", orderHandler.Cancel)
+	mux.Handle("/api/v1/orders", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "customer")(customerMux))
+	mux.Handle("/api/v1/orders/", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "customer")(customerMux))
 
 	// Admin Only Routes
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("POST /api/v1/events", eventHandler.Create)
 	adminMux.HandleFunc("PUT /api/v1/events/{id}", eventHandler.Update)
 	adminMux.HandleFunc("PATCH /api/v1/events/{id}/publish", eventHandler.Publish)
-
+	adminMux.HandleFunc("PATCH /api/v1/events/{id}/cancel", eventHandler.Cancel)
 	mux.Handle("/api/v1/events", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux))
 	mux.Handle("/api/v1/events/", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux))
 
@@ -71,7 +81,6 @@ func main() {
 		Handler: mux,
 	}
 
-	// Graceful Shutdown
 	go func() {
 		log.Printf("Server berjalan di port %s", cfg.AppPort)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
