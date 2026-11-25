@@ -32,6 +32,7 @@ func main() {
 	userRepo := repository.NewUserRepository(db)
 	eventRepo := repository.NewEventRepository(db)
 	orderRepo := repository.NewOrderRepository(db)
+	auditLogRepo := repository.NewAuditLogRepository(db)
 
 	authService := service.NewAuthService(userRepo, cfg)
 	eventService := service.NewEventService(eventRepo)
@@ -40,6 +41,7 @@ func main() {
 	authHandler := handler.NewAuthHandler(authService)
 	eventHandler := handler.NewEventHandler(eventService)
 	orderHandler := handler.NewOrderHandler(orderService)
+	auditLogHandler := handler.NewAuditLogHandler(auditLogRepo)
 
 	mux := http.NewServeMux()
 
@@ -75,10 +77,12 @@ func main() {
 	adminMux.HandleFunc("PUT /api/v1/events/{id}", eventHandler.Update)
 	adminMux.HandleFunc("PATCH /api/v1/events/{id}/publish", eventHandler.Publish)
 	adminMux.HandleFunc("PATCH /api/v1/events/{id}/cancel", eventHandler.Cancel)
-	adminMux.HandleFunc("GET /api/v1/orders", orderHandler.List)        // Admin bisa akses list order
-	adminMux.HandleFunc("GET /api/v1/orders/{id}", orderHandler.Detail) // Admin bisa akses detail order
+	adminMux.HandleFunc("GET /api/v1/orders", orderHandler.List)
+	adminMux.HandleFunc("GET /api/v1/orders/{id}", orderHandler.Detail)
+	adminMux.HandleFunc("GET /api/v1/audit-logs", auditLogHandler.List) // BARU
 	mux.Handle("/api/v1/events", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux))
 	mux.Handle("/api/v1/events/", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux))
+	mux.Handle("/api/v1/audit-logs", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux)) // BARU
 
 	server := &http.Server{
 		Addr:    ":" + cfg.AppPort,
