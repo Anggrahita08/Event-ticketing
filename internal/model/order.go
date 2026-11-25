@@ -12,8 +12,8 @@ type Order struct {
 	TotalPrice  float64    `json:"total_price"`
 	Status      string     `json:"status"`
 	ExpiresAt   time.Time  `json:"expires_at"`
-	PaidAt      *time.Time `json:"paid_at,omitempty"`
-	CancelledAt *time.Time `json:"cancelled_at,omitempty"`
+	PaidAt      *time.Time `json:"paid_at"`
+	CancelledAt *time.Time `json:"cancelled_at"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
 }
@@ -29,7 +29,8 @@ type CreateOrderRequest struct {
 	Quantity int    `json:"quantity"`
 }
 
-// Struct untuk Idempotency
+// IdempotencyKey menyimpan hasil request agar request berulang
+// dengan key yang sama tidak membuat order duplikat.
 type IdempotencyKey struct {
 	Key            string
 	UserID         string
