@@ -31,11 +31,18 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "CONFLICT", "Email sudah terdaftar", nil)
 			return
 		}
+
 		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), nil)
 		return
 	}
 
-	writeSuccess(w, http.StatusCreated, "Registrasi berhasil", user, nil)
+	writeSuccess(
+		w,
+		http.StatusCreated,
+		"Registrasi berhasil",
+		model.UserResponse(user),
+		nil,
+	)
 }
 
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
@@ -51,53 +58,28 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resData := map[string]interface{}{
+	data := map[string]interface{}{
 		"access_token": token,
 		"token_type":   "Bearer",
 		"expires_in":   3600,
-		"user":         user,
+		"user":         model.UserResponse(user),
 	}
-	writeSuccess(w, http.StatusOK, "Login berhasil", resData, nil)
+
+	writeSuccess(w, http.StatusOK, "Login berhasil", data, nil)
 }
 
 func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 	userID, ok := r.Context().Value(middleware.UserContextKey).(string)
-	if !ok {
+	if !ok || userID == "" {
 		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Token tidak valid", nil)
 		return
 	}
 
-	user, err := h.authService.GetUserByID(r.Context(), userID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal mengambil data user", nil)
-		return
-	}
-
-	writeSuccess(w, http.StatusOK, "Data user berhasil diambil", user, nil)
-}
-
-// --- HELPER ENVELOPE RESPONSE ---
-func writeSuccess(w http.ResponseWriter, status int, message string, data interface{}, meta interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(model.SuccessResponse{
-		Success: true,
-		Message: message,
-		Data:    data,
-		Meta:    meta,
-	})
-}
-
-func writeError(w http.ResponseWriter, status int, code string, message string, details []model.ErrorDetail) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	var res model.ErrorResponse
-	res.Success = false
-	res.Message = message
-	res.Error.Code = code
-	res.Error.Details = details
-	if res.Error.Details == nil {
-		res.Error.Details = []model.ErrorDetail{}
-	}
-	json.NewEncoder(w).Encode(res)
+	writeSuccess(
+		w,
+		http.StatusOK,
+		"Data user berhasil diambil",
+		map[string]string{"id": userID},
+		nil,
+	)
 }
