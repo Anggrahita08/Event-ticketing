@@ -66,8 +66,14 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Token tidak valid", nil)
 		return
 	}
-	// Sementara kita return ID-nya dulu, atau kamu bisa query ulang ke DB
-	writeSuccess(w, http.StatusOK, "Data user berhasil diambil", map[string]string{"id": userID}, nil)
+
+	user, err := h.authService.GetUserByID(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal mengambil data user", nil)
+		return
+	}
+
+	writeSuccess(w, http.StatusOK, "Data user berhasil diambil", user, nil)
 }
 
 // --- HELPER ENVELOPE RESPONSE ---

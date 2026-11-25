@@ -219,3 +219,44 @@ func (s *EventService) CancelEvent(ctx context.Context, adminID, id string, req 
 	}
 	return event, cancelledOrders, nil
 }
+
+// Tambahkan di bagian bawah event_service.go
+
+func (s *EventService) GetEvents(ctx context.Context, role string, filter map[string]interface{}, page, limit int) ([]*model.Event, int, error) {
+	// Jika bukan admin, paksa filter status published
+	if role != "admin" {
+		filter["status"] = "published"
+	} else {
+		// Jika admin tapi tidak set status, biarkan kosong (berarti ambil semua)
+		if _, ok := filter["status"]; !ok {
+			delete(filter, "status")
+		}
+	}
+
+	// Validasi limit
+	if limit > 100 {
+		limit = 100
+	}
+	if limit < 1 {
+		limit = 10
+	}
+	if page < 1 {
+		page = 1
+	}
+
+	return s.eventRepo.GetEvents(ctx, filter, page, limit)
+}
+
+func (s *EventService) GetEventDetail(ctx context.Context, role, id string) (*model.Event, error) {
+	event, err := s.eventRepo.FindByID(ctx, id)
+	if err != nil {
+		return nil, model.ErrNotFound
+	}
+
+	// Jika bukan admin dan event belum published, return 404 (sesuai brief)
+	if role != "admin" && event.Status != "published" {
+		return nil, model.ErrNotFound
+	}
+
+	return event, nil
+}

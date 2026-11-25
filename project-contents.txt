@@ -1,0 +1,1956 @@
+
+================================================================================
+FILE: go.mod
+================================================================================
+module project-ticketing-golang
+
+go 1.27.4
+
+require (
+	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/jackc/pgx/v5 v5.13.0
+	github.com/joho/godotenv v1.5.1
+	golang.org/x/crypto v0.59.0
+)
+
+require (
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.3 // indirect
+	golang.org/x/sync v0.25.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
+)
+
+
+================================================================================
+FILE: project-contents.txt
+================================================================================
+
+
+================================================================================
+FILE: project-structure.txt
+================================================================================
+.
+./.env
+./.env.example
+./.git
+./.gitignore
+./cmd
+./cmd/api
+./cmd/api/main.go
+./go.mod
+./go.sum
+./internal
+./internal/config
+./internal/config/config.go
+./internal/handler
+./internal/handler/auth_handler.go
+./internal/handler/event_handler.go
+./internal/handler/order_handler.go
+./internal/middleware
+./internal/middleware/auth.go
+./internal/model
+./internal/model/audit_log.go
+./internal/model/error.go
+./internal/model/event.go
+./internal/model/order.go
+./internal/model/response.go
+./internal/model/user.go
+./internal/repository
+./internal/repository/database.go
+./internal/repository/event_repository.go
+./internal/repository/order_repository.go
+./internal/repository/seeder.go
+./internal/repository/user_repository.go
+./internal/service
+./internal/service/auth_service.go
+./internal/service/event_service.go
+./internal/service/order_service.go
+./internal/worker
+./migrations
+./migrations/000001_init_schema.down.sql
+./migrations/000001_init_schema.up.sql
+./project-structure.txt
+./testdata
+
+
+================================================================================
+FILE: cmd/api/main.go
+================================================================================
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"project-ticketing-golang/internal/config"
+	"project-ticketing-golang/internal/handler"
+	"project-ticketing-golang/internal/middleware"
+	"project-ticketing-golang/internal/repository"
+	"project-ticketing-golang/internal/service"
+)
+
+func main() {
+	cfg := config.LoadConfig()
+
+	db, err := repository.NewPostgresDB(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBName, cfg.DBSSLMode)
+	if err != nil {
+		log.Fatalf("Gagal koneksi ke database: %v", err)
+	}
+	defer db.Close()
+	log.Println("Berhasil terhubung ke database")
+
+	repository.SeedAdmin(context.Background(), db, cfg.AdminEmail, cfg.AdminPassword)
+
+	userRepo := repository.NewUserRepository(db)
+	eventRepo := repository.NewEventRepository(db)
+	orderRepo := repository.NewOrderRepository(db)
+
+	authService := service.NewAuthService(userRepo, cfg)
+	eventService := service.NewEventService(eventRepo)
+	orderService := service.NewOrderService(orderRepo)
+
+	authHandler := handler.NewAuthHandler(authService)
+	eventHandler := handler.NewEventHandler(eventService)
+	orderHandler := handler.NewOrderHandler(orderService)
+
+	mux := http.NewServeMux()
+
+	// Public Routes
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"success": true, "message": "Service sehat", "data": {"status": "up", "database": "up"}}`))
+	})
+	mux.HandleFunc("POST /api/v1/auth/register", authHandler.Register)
+	mux.HandleFunc("POST /api/v1/auth/login", authHandler.Login)
+	mux.HandleFunc("GET /api/v1/events", eventHandler.ListPublic)
+	mux.HandleFunc("GET /api/v1/events/{id}", eventHandler.GetDetail)
+
+	// Auth Routes (Customer/Admin)
+	authMux := http.NewServeMux()
+	authMux.HandleFunc("GET /api/v1/auth/me", authHandler.Me)
+	mux.Handle("/api/v1/auth/me", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "")(authMux))
+
+	// Customer Only Routes
+	customerMux := http.NewServeMux()
+	customerMux.HandleFunc("POST /api/v1/orders", orderHandler.Create)
+	customerMux.HandleFunc("POST /api/v1/orders/{id}/pay", orderHandler.Pay)
+	customerMux.HandleFunc("POST /api/v1/orders/{id}/cancel", orderHandler.Cancel)
+	mux.Handle("/api/v1/orders", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "customer")(customerMux))
+	mux.Handle("/api/v1/orders/", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "customer")(customerMux))
+
+	// Admin Only Routes
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("POST /api/v1/events", eventHandler.Create)
+	adminMux.HandleFunc("PUT /api/v1/events/{id}", eventHandler.Update)
+	adminMux.HandleFunc("PATCH /api/v1/events/{id}/publish", eventHandler.Publish)
+	adminMux.HandleFunc("PATCH /api/v1/events/{id}/cancel", eventHandler.Cancel)
+	mux.Handle("/api/v1/events", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux))
+	mux.Handle("/api/v1/events/", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux))
+
+	server := &http.Server{
+		Addr:    ":" + cfg.AppPort,
+		Handler: mux,
+	}
+
+	go func() {
+		log.Printf("Server berjalan di port %s", cfg.AppPort)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("Mematikan server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+
+	fmt.Println("Server keluar dengan rapi")
+}
+
+
+================================================================================
+FILE: internal/config/config.go
+================================================================================
+package config
+
+import (
+	"log"
+	"os"
+
+	"github.com/joho/godotenv"
+)
+
+type Config struct {
+	AppPort       string
+	DBHost        string
+	DBPort        string
+	DBUser        string
+	DBPassword    string
+	DBName        string
+	DBSSLMode     string
+	JWTSecret     string
+	AdminEmail    string
+	AdminPassword string
+	WorkerCount   string
+	QueueCapacity string
+}
+
+func LoadConfig() *Config {
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("Peringatan: File .env tidak ditemukan, menggunakan environment variable sistem")
+	}
+
+	return &Config{
+		AppPort:       getEnv("APP_PORT", "8080"),
+		DBHost:        getEnv("DB_HOST", "localhost"),
+		DBPort:        getEnv("DB_PORT", "5442"),
+		DBUser:        getEnv("DB_USER", "kiko"),
+		DBPassword:    getEnv("DB_PASSWORD", ""),
+		DBName:        getEnv("DB_NAME", "ticketing_golang"),
+		DBSSLMode:     getEnv("DB_SSLMODE", "disable"),
+		JWTSecret:     getEnv("JWT_SECRET", "secret"),
+		AdminEmail:    getEnv("ADMIN_EMAIL", "admin@example.com"),
+		AdminPassword: getEnv("ADMIN_PASSWORD", "Admin12345"),
+		WorkerCount:   getEnv("IMPORT_WORKER_COUNT", "4"),
+		QueueCapacity: getEnv("IMPORT_QUEUE_CAPACITY", "10"),
+	}
+}
+
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
+}
+
+
+================================================================================
+FILE: internal/handler/auth_handler.go
+================================================================================
+package handler
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+
+	"project-ticketing-golang/internal/middleware"
+	"project-ticketing-golang/internal/model"
+	"project-ticketing-golang/internal/service"
+)
+
+type AuthHandler struct {
+	authService *service.AuthService
+}
+
+func NewAuthHandler(authService *service.AuthService) *AuthHandler {
+	return &AuthHandler{authService: authService}
+}
+
+func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
+	var req model.RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Input tidak valid", nil)
+		return
+	}
+
+	user, err := h.authService.Register(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, model.ErrConflict) {
+			writeError(w, http.StatusConflict, "CONFLICT", "Email sudah terdaftar", nil)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), nil)
+		return
+	}
+
+	writeSuccess(w, http.StatusCreated, "Registrasi berhasil", user, nil)
+}
+
+func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+	var req model.LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Input tidak valid", nil)
+		return
+	}
+
+	token, user, err := h.authService.Login(r.Context(), req)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Email atau password salah", nil)
+		return
+	}
+
+	resData := map[string]interface{}{
+		"access_token": token,
+		"token_type":   "Bearer",
+		"expires_in":   3600,
+		"user":         user,
+	}
+	writeSuccess(w, http.StatusOK, "Login berhasil", resData, nil)
+}
+
+func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(middleware.UserContextKey).(string)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Token tidak valid", nil)
+		return
+	}
+	// Sementara kita return ID-nya dulu, atau kamu bisa query ulang ke DB
+	writeSuccess(w, http.StatusOK, "Data user berhasil diambil", map[string]string{"id": userID}, nil)
+}
+
+// --- HELPER ENVELOPE RESPONSE ---
+func writeSuccess(w http.ResponseWriter, status int, message string, data interface{}, meta interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(model.SuccessResponse{
+		Success: true,
+		Message: message,
+		Data:    data,
+		Meta:    meta,
+	})
+}
+
+func writeError(w http.ResponseWriter, status int, code string, message string, details []model.ErrorDetail) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	var res model.ErrorResponse
+	res.Success = false
+	res.Message = message
+	res.Error.Code = code
+	res.Error.Details = details
+	if res.Error.Details == nil {
+		res.Error.Details = []model.ErrorDetail{}
+	}
+	json.NewEncoder(w).Encode(res)
+}
+
+
+================================================================================
+FILE: internal/handler/event_handler.go
+================================================================================
+package handler
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+
+	"project-ticketing-golang/internal/middleware"
+	"project-ticketing-golang/internal/model"
+	"project-ticketing-golang/internal/service"
+)
+
+type EventHandler struct {
+	eventService *service.EventService
+}
+
+func NewEventHandler(es *service.EventService) *EventHandler {
+	return &EventHandler{eventService: es}
+}
+
+func (h *EventHandler) Create(w http.ResponseWriter, r *http.Request) {
+	adminID, _ := r.Context().Value(middleware.UserContextKey).(string)
+	var req model.CreateEventRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Input tidak valid", nil)
+		return
+	}
+
+	event, err := h.eventService.CreateEvent(r.Context(), adminID, req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), nil)
+		return
+	}
+	writeSuccess(w, http.StatusCreated, "Event berhasil dibuat", event, nil)
+}
+
+func (h *EventHandler) Update(w http.ResponseWriter, r *http.Request) {
+	adminID, _ := r.Context().Value(middleware.UserContextKey).(string)
+	id := r.PathValue("id")
+	var req model.UpdateEventRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Input tidak valid", nil)
+		return
+	}
+
+	event, err := h.eventService.UpdateEvent(r.Context(), adminID, id, req)
+	if err != nil {
+		if err.Error() == "VERSION_CONFLICT" {
+			writeError(w, http.StatusConflict, "VERSION_CONFLICT", "Event sudah diubah oleh pengguna lain, muat ulang data terbaru", nil)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), nil)
+		return
+	}
+	writeSuccess(w, http.StatusOK, "Event berhasil diperbarui", event, nil)
+}
+
+func (h *EventHandler) Publish(w http.ResponseWriter, r *http.Request) {
+	adminID, _ := r.Context().Value(middleware.UserContextKey).(string)
+	id := r.PathValue("id")
+
+	event, err := h.eventService.PublishEvent(r.Context(), adminID, id)
+	if err != nil {
+		writeError(w, http.StatusConflict, "INVALID_STATE", err.Error(), nil)
+		return
+	}
+	writeSuccess(w, http.StatusOK, "Event berhasil diterbitkan", event, nil)
+}
+
+func (h *EventHandler) Cancel(w http.ResponseWriter, r *http.Request) {
+	adminID, _ := r.Context().Value(middleware.UserContextKey).(string)
+	id := r.PathValue("id")
+	var req model.CancelEventRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Input tidak valid", nil)
+		return
+	}
+
+	event, cancelledOrders, err := h.eventService.CancelEvent(r.Context(), adminID, id, req)
+	if err != nil {
+		if err.Error() == "INVALID_STATE" {
+			writeError(w, http.StatusConflict, "INVALID_STATE", "Event sudah dibatalkan", nil)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), nil)
+		return
+	}
+
+	// Custom response untuk cancel sesuai brief
+	responseData := map[string]interface{}{
+		"event":            event,
+		"cancelled_orders": cancelledOrders,
+	}
+	writeSuccess(w, http.StatusOK, "Event berhasil dibatalkan", responseData, nil)
+}
+
+// Ganti fungsi ListPublic dan GetDetail di event_handler.go dengan ini:
+
+func (h *EventHandler) ListPublic(w http.ResponseWriter, r *http.Request) {
+	role := "public"
+	// Coba ambil role dari token jika ada (tanpa memaksa login)
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" {
+		// Logika parsing token sederhana untuk ambil role saja (bisa disempurnakan)
+		// Untuk sementara, kita asumsikan jika ada header, itu customer/admin
+		// (Nanti bisa dioptimalkan)
+		role = "customer"
+	}
+
+	query := r.URL.Query()
+	page := 1
+	limit := 10
+	if p := query.Get("page"); p != "" {
+		fmt.Sscanf(p, "%d", &page)
+	}
+	if l := query.Get("limit"); l != "" {
+		fmt.Sscanf(l, "%d", &limit)
+	}
+
+	filter := map[string]interface{}{
+		"search": query.Get("search"),
+		"status": query.Get("status"),
+		"sort":   query.Get("sort"),
+		"order":  query.Get("order"),
+	}
+
+	events, totalItems, err := h.eventService.GetEvents(r.Context(), role, filter, page, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error(), nil)
+		return
+	}
+
+	totalPages := (totalItems + limit - 1) / limit
+	meta := map[string]interface{}{
+		"page":        page,
+		"limit":       limit,
+		"total_items": totalItems,
+		"total_pages": totalPages,
+	}
+
+	writeSuccess(w, http.StatusOK, "Daftar event berhasil diambil", events, meta)
+}
+
+func (h *EventHandler) GetDetail(w http.ResponseWriter, r *http.Request) {
+	role := "public" // Default
+	id := r.PathValue("id")
+
+	event, err := h.eventService.GetEventDetail(r.Context(), role, id)
+	if err != nil {
+		if err == model.ErrNotFound {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Event tidak ditemukan", nil)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error(), nil)
+		return
+	}
+	writeSuccess(w, http.StatusOK, "Detail event berhasil diambil", event, nil)
+}
+
+
+================================================================================
+FILE: internal/handler/order_handler.go
+================================================================================
+package handler
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"project-ticketing-golang/internal/middleware"
+	"project-ticketing-golang/internal/model"
+	"project-ticketing-golang/internal/service"
+)
+
+type OrderHandler struct {
+	orderService *service.OrderService
+}
+
+func NewOrderHandler(os *service.OrderService) *OrderHandler {
+	return &OrderHandler{orderService: os}
+}
+
+func (h *OrderHandler) Create(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value(middleware.UserContextKey).(string)
+
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" || len(idempotencyKey) > 100 {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Header Idempotency-Key wajib diisi maksimal 100 karakter", nil)
+		return
+	}
+
+	var req model.CreateOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Input tidak valid", nil)
+		return
+	}
+
+	order, isReplay, err := h.orderService.CreateOrder(r.Context(), userID, idempotencyKey, req)
+	if err != nil {
+		switch err.Error() {
+		case "IDEMPOTENCY_KEY_REUSED":
+			writeError(w, http.StatusUnprocessableEntity, "IDEMPOTENCY_KEY_REUSED", "Idempotency-Key sudah dipakai untuk request yang berbeda", nil)
+		case "TICKET_LIMIT_EXCEEDED":
+			writeError(w, http.StatusConflict, "TICKET_LIMIT_EXCEEDED", "Total tiket customer untuk event tersebut akan melebihi 5", nil)
+		case "INSUFFICIENT_QUOTA":
+			writeError(w, http.StatusConflict, "INSUFFICIENT_QUOTA", "Sisa tiket tidak mencukupi", nil)
+		case "INVALID_STATE":
+			writeError(w, http.StatusConflict, "INVALID_STATE", "Event tidak valid atau sudah dimulai", nil)
+		default:
+			writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error(), nil)
+		}
+		return
+	}
+
+	if isReplay {
+		w.Header().Set("Idempotent-Replayed", "true")
+	}
+	writeSuccess(w, http.StatusCreated, "Order berhasil dibuat, selesaikan pembayaran sebelum batas waktu", order, nil)
+}
+
+func (h *OrderHandler) Pay(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value(middleware.UserContextKey).(string)
+	orderID := r.PathValue("id")
+
+	order, err := h.orderService.PayOrder(r.Context(), userID, orderID)
+	if err != nil {
+		if err == model.ErrNotFound {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Order tidak ditemukan", nil)
+			return
+		}
+		writeError(w, http.StatusConflict, "INVALID_STATE", "Order tidak dapat dibayar karena status tidak valid atau sudah expired", nil)
+		return
+	}
+	writeSuccess(w, http.StatusOK, "Pembayaran berhasil", order, nil)
+}
+
+func (h *OrderHandler) Cancel(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value(middleware.UserContextKey).(string)
+	orderID := r.PathValue("id")
+
+	order, err := h.orderService.CancelOrder(r.Context(), userID, orderID)
+	if err != nil {
+		if err == model.ErrNotFound {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Order tidak ditemukan", nil)
+			return
+		}
+		writeError(w, http.StatusConflict, "INVALID_STATE", "Order tidak dapat dibatalkan karena status tidak valid atau event sudah dimulai", nil)
+		return
+	}
+	writeSuccess(w, http.StatusOK, "Order berhasil dibatalkan", order, nil)
+}
+
+// func (h *EventHandler) ListPublic(w http.ResponseWriter, r *http.Request) {
+// 	writeSuccess(w, http.StatusOK, "Daftar event berhasil diambil", []interface{}{}, nil)
+// }
+
+// func (h *EventHandler) GetDetail(w http.ResponseWriter, r *http.Request) {
+
+// 	writeSuccess(w, http.StatusOK, "Detail event berhasil diambil", map[string]string{}, nil)
+// }
+
+
+================================================================================
+FILE: internal/middleware/auth.go
+================================================================================
+package middleware
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+type contextKey string
+
+const UserContextKey contextKey = "user"
+
+func AuthMiddleware(jwtSecret []byte, requiredRole string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+
+			authHeader := r.Header.Get("Authorization")
+			if !strings.HasPrefix(authHeader, "Bearer ") {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"success": false, "message": "Token tidak valid atau sudah kedaluwarsa", "error": {"code": "UNAUTHORIZED", "details": []}}`))
+				return
+			}
+
+			tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+			token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, fmt.Errorf("unexpected signing method")
+				}
+				return jwtSecret, nil
+			})
+
+			if err != nil || !token.Valid {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"success": false, "message": "Token tidak valid atau sudah kedaluwarsa", "error": {"code": "UNAUTHORIZED", "details": []}}`))
+				return
+			}
+
+			claims, ok := token.Claims.(jwt.MapClaims)
+			if !ok {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"success": false, "message": "Token tidak valid", "error": {"code": "UNAUTHORIZED", "details": []}}`))
+				return
+			}
+
+			// Cek Role (jika endpoint khusus admin)
+			role, _ := claims["role"].(string)
+			if requiredRole != "" && role != requiredRole {
+				w.WriteHeader(http.StatusForbidden)
+				w.Write([]byte(`{"success": false, "message": "Anda tidak memiliki akses ke resource ini", "error": {"code": "FORBIDDEN", "details": []}}`))
+				return
+			}
+
+			// Simpan user ID ke context
+			userID, _ := claims["sub"].(string)
+			ctx := context.WithValue(r.Context(), UserContextKey, userID)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+
+================================================================================
+FILE: internal/model/audit_log.go
+================================================================================
+package model
+
+import "encoding/json"
+
+type AuditLog struct {
+	ActorID    *string         `json:"actor_id"`
+	ActorType  string          `json:"actor_type"`
+	EntityType string          `json:"entity_type"`
+	EntityID   string          `json:"entity_id"`
+	Action     string          `json:"action"`
+	Before     json.RawMessage `json:"before"`
+	After      json.RawMessage `json:"after"`
+}
+
+
+================================================================================
+FILE: internal/model/error.go
+================================================================================
+package model
+
+import "errors"
+
+var (
+	ErrNotFound     = errors.New("data tidak ditemukan")
+	ErrConflict     = errors.New("data duplikat")
+	ErrUnauthorized = errors.New("email atau password salah")
+)
+
+
+================================================================================
+FILE: internal/model/event.go
+================================================================================
+package model
+
+import "time"
+
+type Event struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	Venue       string    `json:"venue"`
+	StartAt     time.Time `json:"start_at"`
+	EndAt       time.Time `json:"end_at"`
+	Price       float64   `json:"price"`
+	Quota       int       `json:"quota"`
+	Available   int       `json:"available"`
+	Status      string    `json:"status"`
+	Version     int       `json:"version"`
+	CreatedBy   string    `json:"-"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type CreateEventRequest struct {
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	Venue       string  `json:"venue"`
+	StartAt     string  `json:"start_at"`
+	EndAt       string  `json:"end_at"`
+	Price       float64 `json:"price"`
+	Quota       int     `json:"quota"`
+}
+
+type UpdateEventRequest struct {
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	Venue       string  `json:"venue"`
+	StartAt     string  `json:"start_at"`
+	EndAt       string  `json:"end_at"`
+	Price       float64 `json:"price"`
+	Quota       int     `json:"quota"`
+	Version     int     `json:"version"`
+}
+
+type CancelEventRequest struct {
+	Reason string `json:"reason"`
+}
+
+
+================================================================================
+FILE: internal/model/order.go
+================================================================================
+package model
+
+import "time"
+
+type Order struct {
+	ID          string     `json:"id"`
+	UserID      string     `json:"user_id"`
+	EventID     string     `json:"event_id"`
+	Event       *EventInfo `json:"event,omitempty"`
+	Quantity    int        `json:"quantity"`
+	UnitPrice   float64    `json:"unit_price"`
+	TotalPrice  float64    `json:"total_price"`
+	Status      string     `json:"status"`
+	ExpiresAt   time.Time  `json:"expires_at"`
+	PaidAt      *time.Time `json:"paid_at,omitempty"`
+	CancelledAt *time.Time `json:"cancelled_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+type EventInfo struct {
+	ID      string    `json:"id"`
+	Name    string    `json:"name"`
+	StartAt time.Time `json:"start_at"`
+}
+
+type CreateOrderRequest struct {
+	EventID  string `json:"event_id"`
+	Quantity int    `json:"quantity"`
+}
+
+// Struct untuk Idempotency
+type IdempotencyKey struct {
+	Key            string
+	UserID         string
+	RequestHash    string
+	ResponseStatus int
+	ResponseBody   []byte
+}
+
+
+================================================================================
+FILE: internal/model/response.go
+================================================================================
+package model
+
+type SuccessResponse struct {
+	Success bool        `json:"success"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data"`
+	Meta    interface{} `json:"meta,omitempty"`
+}
+
+type ErrorDetail struct {
+	Field   string `json:"field,omitempty"`
+	Message string `json:"message"`
+	Index   *int   `json:"index,omitempty"`
+}
+
+type ErrorResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Error   struct {
+		Code    string        `json:"code"`
+		Details []ErrorDetail `json:"details"`
+	} `json:"error"`
+}
+
+
+================================================================================
+FILE: internal/model/user.go
+================================================================================
+package model
+
+import "time"
+
+type User struct {
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Email        string    `json:"email"`
+	PasswordHash string    `json:"-"`
+	Role         string    `json:"role"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type RegisterRequest struct {
+	Name     string `json:"name"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+
+================================================================================
+FILE: internal/repository/database.go
+================================================================================
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+func NewPostgresDB(host, port, user, password, dbname, sslmode string) (*sql.DB, error) {
+	// Gunakan format URL
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
+		user, password, host, port, dbname, sslmode)
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = db.PingContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return db, nil
+}
+
+
+================================================================================
+FILE: internal/repository/event_repository.go
+================================================================================
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"project-ticketing-golang/internal/model"
+	"strings"
+)
+
+type EventRepository interface {
+	BeginTx(ctx context.Context) (*sql.Tx, error)
+	Create(ctx context.Context, tx *sql.Tx, event *model.Event) error
+	FindByID(ctx context.Context, id string) (*model.Event, error)
+	FindByIDForUpdate(ctx context.Context, tx *sql.Tx, id string) (*model.Event, error)
+	Update(ctx context.Context, tx *sql.Tx, event *model.Event) error
+	UpdateStatus(ctx context.Context, tx *sql.Tx, id string, status string) error
+	CancelPendingPaidOrders(ctx context.Context, tx *sql.Tx, eventID string) (int64, error)
+	InsertAuditLog(ctx context.Context, tx *sql.Tx, log *model.AuditLog) error
+
+	// Tambahan untuk Event Publik
+	GetEvents(ctx context.Context, filter map[string]interface{}, page, limit int) ([]*model.Event, int, error)
+}
+
+type eventRepository struct {
+	db *sql.DB
+}
+
+func NewEventRepository(db *sql.DB) EventRepository {
+	return &eventRepository{db: db}
+}
+
+func (r *eventRepository) BeginTx(ctx context.Context) (*sql.Tx, error) {
+	return r.db.BeginTx(ctx, nil)
+}
+
+func (r *eventRepository) Create(ctx context.Context, tx *sql.Tx, event *model.Event) error {
+	query := `INSERT INTO events (name, description, venue, start_at, end_at, price, quota, available, status, version, created_by) 
+	          VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'draft', 1, $8) 
+	          RETURNING id, status, version, created_at, updated_at`
+	return tx.QueryRowContext(ctx, query, event.Name, event.Description, event.Venue, event.StartAt, event.EndAt, event.Price, event.Quota, event.CreatedBy).
+		Scan(&event.ID, &event.Status, &event.Version, &event.CreatedAt, &event.UpdatedAt)
+}
+
+func (r *eventRepository) FindByID(ctx context.Context, id string) (*model.Event, error) {
+	query := `SELECT id, name, COALESCE(description, ''), venue, start_at, end_at, price, quota, available, status, version, created_by, created_at, updated_at FROM events WHERE id = $1`
+	row := r.db.QueryRowContext(ctx, query, id)
+	var e model.Event
+	err := row.Scan(&e.ID, &e.Name, &e.Description, &e.Venue, &e.StartAt, &e.EndAt, &e.Price, &e.Quota, &e.Available, &e.Status, &e.Version, &e.CreatedBy, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+func (r *eventRepository) FindByIDForUpdate(ctx context.Context, tx *sql.Tx, id string) (*model.Event, error) {
+	query := `SELECT id, name, COALESCE(description, ''), venue, start_at, end_at, price, quota, available, status, version, created_by, created_at, updated_at FROM events WHERE id = $1 FOR UPDATE`
+	row := tx.QueryRowContext(ctx, query, id)
+	var e model.Event
+	err := row.Scan(&e.ID, &e.Name, &e.Description, &e.Venue, &e.StartAt, &e.EndAt, &e.Price, &e.Quota, &e.Available, &e.Status, &e.Version, &e.CreatedBy, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+func (r *eventRepository) Update(ctx context.Context, tx *sql.Tx, event *model.Event) error {
+	query := `UPDATE events SET name=$1, description=$2, venue=$3, start_at=$4, end_at=$5, price=$6, quota=$7, available=$8, version=version+1, updated_at=NOW() WHERE id=$9`
+	_, err := tx.ExecContext(ctx, query, event.Name, event.Description, event.Venue, event.StartAt, event.EndAt, event.Price, event.Quota, event.Available, event.ID)
+	return err
+}
+
+func (r *eventRepository) UpdateStatus(ctx context.Context, tx *sql.Tx, id string, status string) error {
+	query := `UPDATE events SET status=$1, version=version+1, updated_at=NOW() WHERE id=$2`
+	_, err := tx.ExecContext(ctx, query, status, id)
+	return err
+}
+
+func (r *eventRepository) CancelPendingPaidOrders(ctx context.Context, tx *sql.Tx, eventID string) (int64, error) {
+	query := `UPDATE orders SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW() WHERE event_id = $1 AND status IN ('pending', 'paid')`
+	res, err := tx.ExecContext(ctx, query, eventID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (r *eventRepository) InsertAuditLog(ctx context.Context, tx *sql.Tx, log *model.AuditLog) error {
+	query := `INSERT INTO audit_logs (actor_id, actor_type, entity_type, entity_id, action, before, after) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	_, err := tx.ExecContext(ctx, query, log.ActorID, log.ActorType, log.EntityType, log.EntityID, log.Action, log.Before, log.After)
+	return err
+}
+
+func (r *eventRepository) GetEvents(ctx context.Context, filter map[string]interface{}, page, limit int) ([]*model.Event, int, error) {
+	baseQuery := `FROM events WHERE 1=1`
+	var args []interface{}
+	argId := 1
+
+	if status, ok := filter["status"].(string); ok && status != "" {
+		baseQuery += fmt.Sprintf(" AND status = $%d", argId)
+		args = append(args, status)
+		argId++
+	}
+	if search, ok := filter["search"].(string); ok && search != "" {
+		baseQuery += fmt.Sprintf(" AND (LOWER(name) LIKE $%d OR LOWER(venue) LIKE $%d)", argId, argId)
+		args = append(args, "%"+strings.ToLower(search)+"%")
+		argId++
+	}
+
+	// Count total
+	var totalItems int
+	countQuery := "SELECT COUNT(*) " + baseQuery
+	err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&totalItems)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Pagination & Sort
+	sortBy := "start_at"
+	if s, ok := filter["sort"].(string); ok && s != "" {
+		sortBy = s
+	}
+	order := "ASC"
+	if o, ok := filter["order"].(string); ok && strings.ToLower(o) == "desc" {
+		order = "DESC"
+	}
+
+	offset := (page - 1) * limit
+	query := fmt.Sprintf(`SELECT id, name, COALESCE(description, ''), venue, start_at, end_at, price, quota, available, status, version, created_by, created_at, updated_at %s ORDER BY %s %s LIMIT $%d OFFSET $%d`, baseQuery, sortBy, order, argId, argId+1)
+	args = append(args, limit, offset)
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var events []*model.Event
+	for rows.Next() {
+		var e model.Event
+		err := rows.Scan(&e.ID, &e.Name, &e.Description, &e.Venue, &e.StartAt, &e.EndAt, &e.Price, &e.Quota, &e.Available, &e.Status, &e.Version, &e.CreatedBy, &e.CreatedAt, &e.UpdatedAt)
+		if err != nil {
+			return nil, 0, err
+		}
+		events = append(events, &e)
+	}
+	return events, totalItems, nil
+}
+
+
+================================================================================
+FILE: internal/repository/order_repository.go
+================================================================================
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"project-ticketing-golang/internal/model"
+)
+
+type OrderRepository interface {
+	BeginTx(ctx context.Context) (*sql.Tx, error)
+	GetEventForUpdate(ctx context.Context, tx *sql.Tx, eventID string) (*model.Event, error)
+	CheckUserTicketLimit(ctx context.Context, tx *sql.Tx, userID, eventID string) (int, error)
+	CreateOrder(ctx context.Context, tx *sql.Tx, order *model.Order) error
+	ReduceEventQuota(ctx context.Context, tx *sql.Tx, eventID string, quantity int) error
+	FindOrderByID(ctx context.Context, id string) (*model.Order, error)
+	FindOrderByIDForUpdate(ctx context.Context, tx *sql.Tx, id string) (*model.Order, error)
+	UpdateOrderStatus(ctx context.Context, tx *sql.Tx, id string, status string) error
+	ReturnEventQuota(ctx context.Context, tx *sql.Tx, eventID string, quantity int) error
+
+	// Idempotency
+	GetIdempotencyKey(ctx context.Context, tx *sql.Tx, userID, key string) (*model.IdempotencyKey, error)
+	SaveIdempotencyKey(ctx context.Context, tx *sql.Tx, ik *model.IdempotencyKey) error
+}
+
+type orderRepository struct {
+	db *sql.DB
+}
+
+func NewOrderRepository(db *sql.DB) OrderRepository {
+	return &orderRepository{db: db}
+}
+
+func (r *orderRepository) BeginTx(ctx context.Context) (*sql.Tx, error) {
+	return r.db.BeginTx(ctx, nil)
+}
+
+func (r *orderRepository) GetEventForUpdate(ctx context.Context, tx *sql.Tx, eventID string) (*model.Event, error) {
+	query := `SELECT id, name, start_at, end_at, price, quota, available, status FROM events WHERE id = $1 FOR UPDATE`
+	row := tx.QueryRowContext(ctx, query, eventID)
+	var e model.Event
+	err := row.Scan(&e.ID, &e.Name, &e.StartAt, &e.EndAt, &e.Price, &e.Quota, &e.Available, &e.Status)
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+func (r *orderRepository) CheckUserTicketLimit(ctx context.Context, tx *sql.Tx, userID, eventID string) (int, error) {
+	query := `SELECT COALESCE(SUM(quantity), 0) FROM orders WHERE user_id = $1 AND event_id = $2 AND status IN ('pending', 'paid')`
+	var total int
+	err := tx.QueryRowContext(ctx, query, userID, eventID).Scan(&total)
+	return total, err
+}
+
+func (r *orderRepository) CreateOrder(ctx context.Context, tx *sql.Tx, order *model.Order) error {
+	query := `INSERT INTO orders (user_id, event_id, quantity, unit_price, total_price, status, expires_at) 
+	          VALUES ($1, $2, $3, $4, $5, 'pending', $6) 
+	          RETURNING id, created_at, updated_at`
+	return tx.QueryRowContext(ctx, query, order.UserID, order.EventID, order.Quantity, order.UnitPrice, order.TotalPrice, order.ExpiresAt).
+		Scan(&order.ID, &order.CreatedAt, &order.UpdatedAt)
+}
+
+func (r *orderRepository) ReduceEventQuota(ctx context.Context, tx *sql.Tx, eventID string, quantity int) error {
+	// Atomic update untuk mencegah race condition (sesuai brief)
+	query := `UPDATE events SET available = available - $1, updated_at = NOW() WHERE id = $2 AND available >= $1`
+	res, err := tx.ExecContext(ctx, query, quantity, eventID)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return sql.ErrNoRows // Kuota tidak cukup
+	}
+	return nil
+}
+
+func (r *orderRepository) FindOrderByID(ctx context.Context, id string) (*model.Order, error) {
+	query := `SELECT o.id, o.user_id, o.event_id, e.name, e.start_at, o.quantity, o.unit_price, o.total_price, o.status, o.expires_at, o.paid_at, o.cancelled_at, o.created_at, o.updated_at 
+	          FROM orders o JOIN events e ON o.event_id = e.id WHERE o.id = $1`
+	row := r.db.QueryRowContext(ctx, query, id)
+	var o model.Order
+	var evName string
+	var evStartAt sql.NullTime
+	err := row.Scan(&o.ID, &o.UserID, &o.EventID, &evName, &evStartAt, &o.Quantity, &o.UnitPrice, &o.TotalPrice, &o.Status, &o.ExpiresAt, &o.PaidAt, &o.CancelledAt, &o.CreatedAt, &o.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if evStartAt.Valid {
+		o.Event = &model.EventInfo{ID: o.EventID, Name: evName, StartAt: evStartAt.Time}
+	}
+	return &o, nil
+}
+
+func (r *orderRepository) FindOrderByIDForUpdate(ctx context.Context, tx *sql.Tx, id string) (*model.Order, error) {
+	query := `SELECT id, user_id, event_id, quantity, status, expires_at FROM orders WHERE id = $1 FOR UPDATE`
+	row := tx.QueryRowContext(ctx, query, id)
+	var o model.Order
+	err := row.Scan(&o.ID, &o.UserID, &o.EventID, &o.Quantity, &o.Status, &o.ExpiresAt)
+	if err != nil {
+		return nil, err
+	}
+	return &o, nil
+}
+
+func (r *orderRepository) UpdateOrderStatus(ctx context.Context, tx *sql.Tx, id string, status string) error {
+	query := `UPDATE orders SET status = $1, updated_at = NOW()`
+	args := []interface{}{status}
+
+	if status == "paid" {
+		query += `, paid_at = NOW()`
+	} else if status == "cancelled" {
+		query += `, cancelled_at = NOW()`
+	}
+
+	query += ` WHERE id = $2`
+	args = append(args, id)
+
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
+func (r *orderRepository) ReturnEventQuota(ctx context.Context, tx *sql.Tx, eventID string, quantity int) error {
+	query := `UPDATE events SET available = available + $1, updated_at = NOW() WHERE id = $2`
+	_, err := tx.ExecContext(ctx, query, quantity, eventID)
+	return err
+}
+
+func (r *orderRepository) GetIdempotencyKey(ctx context.Context, tx *sql.Tx, userID, key string) (*model.IdempotencyKey, error) {
+	query := `SELECT key, user_id, request_hash, response_status, response_body FROM idempotency_keys WHERE user_id = $1 AND key = $2 FOR UPDATE`
+	row := tx.QueryRowContext(ctx, query, userID, key)
+	var ik model.IdempotencyKey
+	err := row.Scan(&ik.Key, &ik.UserID, &ik.RequestHash, &ik.ResponseStatus, &ik.ResponseBody)
+	if err != nil {
+		return nil, err
+	}
+	return &ik, nil
+}
+
+func (r *orderRepository) SaveIdempotencyKey(ctx context.Context, tx *sql.Tx, ik *model.IdempotencyKey) error {
+	query := `INSERT INTO idempotency_keys (key, user_id, request_hash, response_status, response_body) VALUES ($1, $2, $3, $4, $5)`
+	_, err := tx.ExecContext(ctx, query, ik.Key, ik.UserID, ik.RequestHash, ik.ResponseStatus, ik.ResponseBody)
+	return err
+}
+
+
+================================================================================
+FILE: internal/repository/seeder.go
+================================================================================
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"log"
+	"strings"
+
+	"golang.org/x/crypto/bcrypt"
+)
+
+func SeedAdmin(ctx context.Context, db *sql.DB, email, password string) {
+	var exists bool
+	queryCheck := `SELECT EXISTS(SELECT 1 FROM users WHERE LOWER(email) = LOWER($1))`
+	err := db.QueryRowContext(ctx, queryCheck, email).Scan(&exists)
+	if err != nil {
+		log.Printf("Gagal cek admin seed: %v", err)
+		return
+	}
+
+	if !exists {
+		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		queryInsert := `INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, 'admin')`
+		_, err = db.ExecContext(ctx, queryInsert, "Super Admin", strings.ToLower(email), string(hashedPassword))
+		if err != nil {
+			log.Printf("Gagal membuat admin seed: %v", err)
+		} else {
+			log.Println("Akun admin pertama berhasil dibuat")
+		}
+	} else {
+		log.Println("Akun admin sudah ada, skip seeding")
+	}
+}
+
+
+================================================================================
+FILE: internal/repository/user_repository.go
+================================================================================
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"project-ticketing-golang/internal/model"
+)
+
+type UserRepository interface {
+	Create(ctx context.Context, user *model.User) error
+	FindByEmail(ctx context.Context, email string) (*model.User, error)
+	FindByID(ctx context.Context, id string) (*model.User, error)
+}
+
+type userRepository struct {
+	db *sql.DB
+}
+
+func NewUserRepository(db *sql.DB) UserRepository {
+	return &userRepository{db: db}
+}
+
+func (r *userRepository) Create(ctx context.Context, user *model.User) error {
+	query := `INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id, created_at`
+	return r.db.QueryRowContext(ctx, query, user.Name, user.Email, user.PasswordHash, user.Role).Scan(&user.ID, &user.CreatedAt)
+}
+
+func (r *userRepository) FindByEmail(ctx context.Context, email string) (*model.User, error) {
+	query := `SELECT id, name, email, password_hash, role, created_at FROM users WHERE LOWER(email) = LOWER($1)`
+	row := r.db.QueryRowContext(ctx, query, email)
+	var u model.User
+	err := row.Scan(&u.ID, &u.Name, &u.Email, &u.PasswordHash, &u.Role, &u.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+func (r *userRepository) FindByID(ctx context.Context, id string) (*model.User, error) {
+	query := `SELECT id, name, email, password_hash, role, created_at FROM users WHERE id = $1`
+	row := r.db.QueryRowContext(ctx, query, id)
+	var u model.User
+	err := row.Scan(&u.ID, &u.Name, &u.Email, &u.PasswordHash, &u.Role, &u.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+
+================================================================================
+FILE: internal/service/auth_service.go
+================================================================================
+package service
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"project-ticketing-golang/internal/config"
+	"project-ticketing-golang/internal/model"
+	"project-ticketing-golang/internal/repository"
+
+	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/crypto/bcrypt"
+)
+
+type AuthService struct {
+	userRepo  repository.UserRepository
+	jwtSecret []byte
+}
+
+func NewAuthService(userRepo repository.UserRepository, cfg *config.Config) *AuthService {
+	return &AuthService{
+		userRepo:  userRepo,
+		jwtSecret: []byte(cfg.JWTSecret),
+	}
+}
+
+func (s *AuthService) Register(ctx context.Context, req model.RegisterRequest) (*model.User, error) {
+	// Validasi sederhana
+	if len(req.Password) < 8 || len(req.Password) > 72 {
+		return nil, errors.New("VALIDATION_ERROR:password harus 8-72 karakter")
+	}
+
+	// Cek email sudah ada atau belum
+	existing, _ := s.userRepo.FindByEmail(ctx, req.Email)
+	if existing != nil {
+		return nil, model.ErrConflict
+	}
+
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, err
+	}
+
+	user := &model.User{
+		Name:         req.Name,
+		Email:        strings.ToLower(req.Email),
+		PasswordHash: string(hashedPassword),
+		Role:         "customer", // Sesuai brief: register selalu customer
+	}
+
+	err = s.userRepo.Create(ctx, user)
+	if err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+
+func (s *AuthService) Login(ctx context.Context, req model.LoginRequest) (string, *model.User, error) {
+	user, err := s.userRepo.FindByEmail(ctx, req.Email)
+	if err != nil {
+		return "", nil, model.ErrUnauthorized // Pesan error disamakan sesuai brief
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password))
+	if err != nil {
+		return "", nil, model.ErrUnauthorized
+	}
+
+	// Buat JWT
+	claims := jwt.MapClaims{
+		"sub":  user.ID,
+		"role": user.Role,
+		"iat":  time.Now().Unix(),
+		"exp":  time.Now().Add(time.Hour).Unix(), // Expire 1 jam
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString(s.jwtSecret)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return tokenString, user, nil
+}
+
+
+================================================================================
+FILE: internal/service/event_service.go
+================================================================================
+package service
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"project-ticketing-golang/internal/model"
+	"project-ticketing-golang/internal/repository"
+)
+
+type EventService struct {
+	eventRepo repository.EventRepository
+}
+
+func NewEventService(eventRepo repository.EventRepository) *EventService {
+	return &EventService{eventRepo: eventRepo}
+}
+
+func (s *EventService) CreateEvent(ctx context.Context, adminID string, req model.CreateEventRequest) (*model.Event, error) {
+	startAt, _ := time.Parse(time.RFC3339, req.StartAt)
+	endAt, _ := time.Parse(time.RFC3339, req.EndAt)
+
+	if startAt.Before(time.Now()) {
+		return nil, errors.New("start_at harus di masa depan")
+	}
+	if !endAt.After(startAt) {
+		return nil, errors.New("end_at harus setelah start_at")
+	}
+
+	event := &model.Event{
+		Name:        req.Name,
+		Description: req.Description,
+		Venue:       req.Venue,
+		StartAt:     startAt,
+		EndAt:       endAt,
+		Price:       req.Price,
+		Quota:       req.Quota,
+		Available:   req.Quota,
+		CreatedBy:   adminID,
+	}
+
+	tx, err := s.eventRepo.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	err = s.eventRepo.Create(ctx, tx, event)
+	if err != nil {
+		return nil, err
+	}
+
+	afterJSON, _ := json.Marshal(event)
+	audit := &model.AuditLog{
+		ActorID:    &adminID,
+		ActorType:  "user",
+		EntityType: "event",
+		EntityID:   event.ID,
+		Action:     "create",
+		Before:     nil,
+		After:      afterJSON,
+	}
+	s.eventRepo.InsertAuditLog(ctx, tx, audit)
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return event, nil
+}
+
+func (s *EventService) UpdateEvent(ctx context.Context, adminID, id string, req model.UpdateEventRequest) (*model.Event, error) {
+	tx, err := s.eventRepo.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	event, err := s.eventRepo.FindByIDForUpdate(ctx, tx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, model.ErrNotFound
+		}
+		return nil, err
+	}
+
+	if event.Status == "cancelled" {
+		return nil, errors.New("event cancelled tidak bisa diubah")
+	}
+
+	if event.Version != req.Version {
+		return nil, errors.New("VERSION_CONFLICT")
+	}
+
+	beforeJSON, _ := json.Marshal(event)
+
+	startAt, _ := time.Parse(time.RFC3339, req.StartAt)
+	endAt, _ := time.Parse(time.RFC3339, req.EndAt)
+
+	terpakai := event.Quota - event.Available
+	if req.Quota < terpakai {
+		return nil, errors.New("quota tidak boleh lebih kecil dari tiket terpakai")
+	}
+
+	event.Name = req.Name
+	event.Description = req.Description
+	event.Venue = req.Venue
+	event.StartAt = startAt
+	event.EndAt = endAt
+	event.Price = req.Price
+	event.Quota = req.Quota
+	event.Available = req.Quota - terpakai
+
+	err = s.eventRepo.Update(ctx, tx, event)
+	if err != nil {
+		return nil, err
+	}
+
+	event.Version++
+	event.UpdatedAt = time.Now()
+
+	afterJSON, _ := json.Marshal(event)
+	audit := &model.AuditLog{
+		ActorID:    &adminID,
+		ActorType:  "user",
+		EntityType: "event",
+		EntityID:   event.ID,
+		Action:     "update",
+		Before:     beforeJSON,
+		After:      afterJSON,
+	}
+	s.eventRepo.InsertAuditLog(ctx, tx, audit)
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return event, nil
+}
+
+func (s *EventService) PublishEvent(ctx context.Context, adminID, id string) (*model.Event, error) {
+	tx, err := s.eventRepo.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	event, err := s.eventRepo.FindByIDForUpdate(ctx, tx, id)
+	if err != nil {
+		return nil, model.ErrNotFound
+	}
+
+	if event.Status != "draft" {
+		return nil, errors.New("INVALID_STATE")
+	}
+	if event.StartAt.Before(time.Now()) {
+		return nil, errors.New("start_at sudah lewat")
+	}
+
+	beforeJSON, _ := json.Marshal(event)
+	s.eventRepo.UpdateStatus(ctx, tx, id, "published")
+	event.Status = "published"
+	event.Version++
+	afterJSON, _ := json.Marshal(event)
+
+	audit := &model.AuditLog{
+		ActorID: &adminID, ActorType: "user", EntityType: "event",
+		EntityID: event.ID, Action: "publish", Before: beforeJSON, After: afterJSON,
+	}
+	s.eventRepo.InsertAuditLog(ctx, tx, audit)
+
+	tx.Commit()
+	return event, nil
+}
+
+func (s *EventService) CancelEvent(ctx context.Context, adminID, id string, req model.CancelEventRequest) (*model.Event, int64, error) {
+	if len(req.Reason) < 5 || len(req.Reason) > 255 {
+		return nil, 0, errors.New("reason wajib, 5-255 karakter")
+	}
+
+	tx, err := s.eventRepo.BeginTx(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer tx.Rollback()
+
+	event, err := s.eventRepo.FindByIDForUpdate(ctx, tx, id)
+	if err != nil {
+		return nil, 0, model.ErrNotFound
+	}
+
+	if event.Status == "cancelled" {
+		return nil, 0, errors.New("INVALID_STATE")
+	}
+
+	beforeJSON, _ := json.Marshal(event)
+
+	// Ubah status event
+	s.eventRepo.UpdateStatus(ctx, tx, id, "cancelled")
+	event.Status = "cancelled"
+	event.Version++
+
+	// Batalkan semua order pending & paid
+	cancelledOrders, err := s.eventRepo.CancelPendingPaidOrders(ctx, tx, id)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	afterJSON, _ := json.Marshal(event)
+	audit := &model.AuditLog{
+		ActorID: &adminID, ActorType: "user", EntityType: "event",
+		EntityID: event.ID, Action: "cancel", Before: beforeJSON, After: afterJSON,
+	}
+	s.eventRepo.InsertAuditLog(ctx, tx, audit)
+
+	if err := tx.Commit(); err != nil {
+		return nil, 0, err
+	}
+	return event, cancelledOrders, nil
+}
+
+// Tambahkan di bagian bawah event_service.go
+
+func (s *EventService) GetEvents(ctx context.Context, role string, filter map[string]interface{}, page, limit int) ([]*model.Event, int, error) {
+	// Jika bukan admin, paksa filter status published
+	if role != "admin" {
+		filter["status"] = "published"
+	} else {
+		// Jika admin tapi tidak set status, biarkan kosong (berarti ambil semua)
+		if _, ok := filter["status"]; !ok {
+			delete(filter, "status")
+		}
+	}
+
+	// Validasi limit
+	if limit > 100 {
+		limit = 100
+	}
+	if limit < 1 {
+		limit = 10
+	}
+	if page < 1 {
+		page = 1
+	}
+
+	return s.eventRepo.GetEvents(ctx, filter, page, limit)
+}
+
+func (s *EventService) GetEventDetail(ctx context.Context, role, id string) (*model.Event, error) {
+	event, err := s.eventRepo.FindByID(ctx, id)
+	if err != nil {
+		return nil, model.ErrNotFound
+	}
+
+	// Jika bukan admin dan event belum published, return 404 (sesuai brief)
+	if role != "admin" && event.Status != "published" {
+		return nil, model.ErrNotFound
+	}
+
+	return event, nil
+}
+
+
+================================================================================
+FILE: internal/service/order_service.go
+================================================================================
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"project-ticketing-golang/internal/model"
+	"project-ticketing-golang/internal/repository"
+)
+
+type OrderService struct {
+	orderRepo repository.OrderRepository
+}
+
+func NewOrderService(orderRepo repository.OrderRepository) *OrderService {
+	return &OrderService{orderRepo: orderRepo}
+}
+
+func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey string, req model.CreateOrderRequest) (*model.Order, bool, error) {
+	// 1. Validasi input
+	if req.Quantity < 1 || req.Quantity > 5 {
+		return nil, false, errors.New("quantity harus antara 1-5")
+	}
+
+	// Hitung hash body request untuk idempotency
+	bodyBytes, _ := json.Marshal(req)
+	hash := sha256.Sum256(bodyBytes)
+	reqHash := hex.EncodeToString(hash[:])
+
+	tx, err := s.orderRepo.BeginTx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback()
+
+	// 2. Cek Idempotency (SELECT ... FOR UPDATE)
+	existingKey, err := s.orderRepo.GetIdempotencyKey(ctx, tx, userID, idempotencyKey)
+	if err == nil {
+		// Key sudah ada
+		if existingKey.RequestHash != reqHash {
+			return nil, false, errors.New("IDEMPOTENCY_KEY_REUSED")
+		}
+		// Body sama, kembalikan response sebelumnya
+		var prevOrder model.Order
+		json.Unmarshal(existingKey.ResponseBody, &prevOrder)
+		return &prevOrder, true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, err
+	}
+
+	// 3. Lock Event Row & Cek Status/Kuota
+	event, err := s.orderRepo.GetEventForUpdate(ctx, tx, req.EventID)
+	if err != nil {
+		return nil, false, model.ErrNotFound
+	}
+
+	if event.Status != "published" {
+		return nil, false, errors.New("INVALID_STATE")
+	}
+	if event.StartAt.Before(time.Now()) {
+		return nil, false, errors.New("INVALID_STATE")
+	}
+
+	// 4. Cek Batas 5 Tiket per Customer
+	existingTickets, err := s.orderRepo.CheckUserTicketLimit(ctx, tx, userID, req.EventID)
+	if err != nil {
+		return nil, false, err
+	}
+	if existingTickets+req.Quantity > 5 {
+		return nil, false, errors.New("TICKET_LIMIT_EXCEEDED")
+	}
+
+	// 5. Kurangi Kuota (Atomic Update)
+	err = s.orderRepo.ReduceEventQuota(ctx, tx, req.EventID, req.Quantity)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, errors.New("INSUFFICIENT_QUOTA")
+		}
+		return nil, false, err
+	}
+
+	// 6. Buat Order
+	order := &model.Order{
+		UserID:     userID,
+		EventID:    req.EventID,
+		Quantity:   req.Quantity,
+		UnitPrice:  event.Price,
+		TotalPrice: float64(req.Quantity) * event.Price,
+		Status:     "pending",
+		ExpiresAt:  time.Now().Add(15 * time.Minute),
+	}
+
+	err = s.orderRepo.CreateOrder(ctx, tx, order)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Siapkan response object
+	order.Event = &model.EventInfo{ID: event.ID, Name: event.Name, StartAt: event.StartAt}
+
+	// 7. Simpan Idempotency Key (Hanya jika sukses)
+	responseBody, _ := json.Marshal(order)
+	ik := &model.IdempotencyKey{
+		Key:            idempotencyKey,
+		UserID:         userID,
+		RequestHash:    reqHash,
+		ResponseStatus: 201,
+		ResponseBody:   responseBody,
+	}
+	err = s.orderRepo.SaveIdempotencyKey(ctx, tx, ik)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+
+	return order, false, nil
+}
+
+func (s *OrderService) PayOrder(ctx context.Context, userID, orderID string) (*model.Order, error) {
+	tx, err := s.orderRepo.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	order, err := s.orderRepo.FindOrderByIDForUpdate(ctx, tx, orderID)
+	if err != nil {
+		return nil, model.ErrNotFound
+	}
+
+	// Cek kepemilikan (jika bukan miliknya, return 404)
+	if order.UserID != userID {
+		return nil, model.ErrNotFound
+	}
+
+	if order.Status != "pending" {
+		return nil, errors.New("INVALID_STATE")
+	}
+	if order.ExpiresAt.Before(time.Now()) {
+		return nil, errors.New("INVALID_STATE")
+	}
+
+	s.orderRepo.UpdateOrderStatus(ctx, tx, orderID, "paid")
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return s.orderRepo.FindOrderByID(ctx, orderID)
+}
+
+func (s *OrderService) CancelOrder(ctx context.Context, userID, orderID string) (*model.Order, error) {
+	tx, err := s.orderRepo.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	order, err := s.orderRepo.FindOrderByIDForUpdate(ctx, tx, orderID)
+	if err != nil {
+		return nil, model.ErrNotFound
+	}
+
+	if order.UserID != userID {
+		return nil, model.ErrNotFound
+	}
+
+	if order.Status != "pending" && order.Status != "paid" {
+		return nil, errors.New("INVALID_STATE")
+	}
+
+	// Cek apakah event sudah mulai
+	event, err := s.orderRepo.GetEventForUpdate(ctx, tx, order.EventID)
+	if err != nil {
+		return nil, err
+	}
+	if event.StartAt.Before(time.Now()) {
+		return nil, errors.New("INVALID_STATE")
+	}
+
+	s.orderRepo.UpdateOrderStatus(ctx, tx, orderID, "cancelled")
+	s.orderRepo.ReturnEventQuota(ctx, tx, order.EventID, order.Quantity)
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return s.orderRepo.FindOrderByID(ctx, orderID)
+}
+
+
+================================================================================
+FILE: migrations/000001_init_schema.down.sql
+================================================================================
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS import_jobs;
+DROP TABLE IF EXISTS idempotency_keys;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS events;
+DROP TABLE IF EXISTS users;
+DROP EXTENSION IF EXISTS "uuid-ossp";
+
+================================================================================
+FILE: migrations/000001_init_schema.up.sql
+================================================================================
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 1. Tabel users
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(150) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(20) NOT NULL CHECK (role IN ('admin', 'customer')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX idx_users_email_lower ON users (LOWER(email));
+
+-- 2. Tabel events
+CREATE TABLE events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(150) NOT NULL,
+    description TEXT,
+    venue VARCHAR(150) NOT NULL,
+    start_at TIMESTAMPTZ NOT NULL,
+    end_at TIMESTAMPTZ NOT NULL,
+    price NUMERIC(15,2) NOT NULL CHECK (price >= 0),
+    quota INTEGER NOT NULL CHECK (quota >= 1 AND quota <= 10000),
+    available INTEGER NOT NULL CHECK (available >= 0),
+    status VARCHAR(20) NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'cancelled')),
+    version INTEGER NOT NULL DEFAULT 1,
+    created_by UUID NOT NULL REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_events_status ON events(status);
+
+-- 3. Tabel orders
+CREATE TABLE orders (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id),
+    event_id UUID NOT NULL REFERENCES events(id),
+    quantity INTEGER NOT NULL CHECK (quantity >= 1 AND quantity <= 5),
+    unit_price NUMERIC(15,2) NOT NULL,
+    total_price NUMERIC(15,2) NOT NULL,
+    status VARCHAR(20) NOT NULL CHECK (status IN ('pending', 'paid', 'cancelled', 'expired')),
+    expires_at TIMESTAMPTZ NOT NULL,
+    paid_at TIMESTAMPTZ,
+    cancelled_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_orders_status_expires ON orders(status, expires_at);
+CREATE INDEX idx_orders_user_id ON orders(user_id);
+CREATE INDEX idx_orders_event_id ON orders(event_id);
+
+-- 4. Tabel idempotency_keys
+CREATE TABLE idempotency_keys (
+    key VARCHAR(100) NOT NULL,
+    user_id UUID NOT NULL REFERENCES users(id),
+    request_hash VARCHAR(64) NOT NULL,
+    response_status INTEGER NOT NULL,
+    response_body JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, key)
+);
+
+-- 5. Tabel import_jobs
+CREATE TABLE import_jobs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    file_name VARCHAR(255) NOT NULL,
+    status VARCHAR(20) NOT NULL CHECK (status IN ('queued', 'processing', 'completed', 'failed')),
+    total_rows INTEGER NOT NULL DEFAULT 0,
+    success_rows INTEGER NOT NULL DEFAULT 0,
+    failed_rows INTEGER NOT NULL DEFAULT 0,
+    errors JSONB,
+    created_by UUID NOT NULL REFERENCES users(id),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 6. Tabel audit_logs
+CREATE TABLE audit_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    actor_id UUID REFERENCES users(id),
+    actor_type VARCHAR(20) NOT NULL CHECK (actor_type IN ('user', 'system')),
+    entity_type VARCHAR(30) NOT NULL CHECK (entity_type IN ('event', 'order')),
+    entity_id UUID NOT NULL,
+    action VARCHAR(30) NOT NULL,
+    before JSONB,
+    after JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_audit_logs_entity ON audit_logs(entity_type, entity_id);

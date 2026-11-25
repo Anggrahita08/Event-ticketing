@@ -85,3 +85,7 @@ func (s *AuthService) Login(ctx context.Context, req model.LoginRequest) (string
 
 	return tokenString, user, nil
 }
+
+func (s *AuthService) GetUserByID(ctx context.Context, id string) (*model.User, error) {
+	return s.userRepo.FindByID(ctx, id)
+}
