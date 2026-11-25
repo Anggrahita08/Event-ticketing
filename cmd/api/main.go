@@ -15,6 +15,7 @@ import (
 	"project-ticketing-golang/internal/middleware"
 	"project-ticketing-golang/internal/repository"
 	"project-ticketing-golang/internal/service"
+	"project-ticketing-golang/internal/worker"
 )
 
 func main() {
@@ -33,6 +34,7 @@ func main() {
 	eventRepo := repository.NewEventRepository(db)
 	orderRepo := repository.NewOrderRepository(db)
 	auditLogRepo := repository.NewAuditLogRepository(db)
+	workerRepo := repository.NewWorkerRepository(db)
 
 	authService := service.NewAuthService(userRepo, cfg)
 	eventService := service.NewEventService(eventRepo)
@@ -42,6 +44,9 @@ func main() {
 	eventHandler := handler.NewEventHandler(eventService)
 	orderHandler := handler.NewOrderHandler(orderService)
 	auditLogHandler := handler.NewAuditLogHandler(auditLogRepo)
+
+	// Inisialisasi Worker
+	expiryWorker := worker.NewExpiryWorker(workerRepo)
 
 	mux := http.NewServeMux()
 
@@ -61,7 +66,7 @@ func main() {
 	authMux.HandleFunc("GET /api/v1/auth/me", authHandler.Me)
 	mux.Handle("/api/v1/auth/me", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "")(authMux))
 
-	// Customer Only Routes (Or logged in)
+	// Customer Only Routes
 	customerMux := http.NewServeMux()
 	customerMux.HandleFunc("POST /api/v1/orders", orderHandler.Create)
 	customerMux.HandleFunc("POST /api/v1/orders/{id}/pay", orderHandler.Pay)
@@ -79,15 +84,19 @@ func main() {
 	adminMux.HandleFunc("PATCH /api/v1/events/{id}/cancel", eventHandler.Cancel)
 	adminMux.HandleFunc("GET /api/v1/orders", orderHandler.List)
 	adminMux.HandleFunc("GET /api/v1/orders/{id}", orderHandler.Detail)
-	adminMux.HandleFunc("GET /api/v1/audit-logs", auditLogHandler.List) // BARU
+	adminMux.HandleFunc("GET /api/v1/audit-logs", auditLogHandler.List)
 	mux.Handle("/api/v1/events", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux))
 	mux.Handle("/api/v1/events/", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux))
-	mux.Handle("/api/v1/audit-logs", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux)) // BARU
+	mux.Handle("/api/v1/audit-logs", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux))
 
 	server := &http.Server{
 		Addr:    ":" + cfg.AppPort,
 		Handler: mux,
 	}
+
+	// Context untuk Worker
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	go expiryWorker.Start(workerCtx)
 
 	go func() {
 		log.Printf("Server berjalan di port %s", cfg.AppPort)
@@ -100,6 +109,9 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("Mematikan server...")
+
+	// Hentikan worker
+	stopWorker()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
