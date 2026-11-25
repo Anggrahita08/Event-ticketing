@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"project-ticketing-golang/internal/model"
 )
 
@@ -16,10 +17,11 @@ type OrderRepository interface {
 	FindOrderByIDForUpdate(ctx context.Context, tx *sql.Tx, id string) (*model.Order, error)
 	UpdateOrderStatus(ctx context.Context, tx *sql.Tx, id string, status string) error
 	ReturnEventQuota(ctx context.Context, tx *sql.Tx, eventID string, quantity int) error
-
-	// Idempotency
 	GetIdempotencyKey(ctx context.Context, tx *sql.Tx, userID, key string) (*model.IdempotencyKey, error)
 	SaveIdempotencyKey(ctx context.Context, tx *sql.Tx, ik *model.IdempotencyKey) error
+
+	// BARU: Untuk Get List Orders
+	GetOrders(ctx context.Context, userID string, isAdmin bool, status, eventID string, page, limit int) ([]*model.Order, int, error)
 }
 
 type orderRepository struct {
@@ -61,7 +63,6 @@ func (r *orderRepository) CreateOrder(ctx context.Context, tx *sql.Tx, order *mo
 }
 
 func (r *orderRepository) ReduceEventQuota(ctx context.Context, tx *sql.Tx, eventID string, quantity int) error {
-	// Atomic update untuk mencegah race condition (sesuai brief)
 	query := `UPDATE events SET available = available - $1, updated_at = NOW() WHERE id = $2 AND available >= $1`
 	res, err := tx.ExecContext(ctx, query, quantity, eventID)
 	if err != nil {
@@ -69,7 +70,7 @@ func (r *orderRepository) ReduceEventQuota(ctx context.Context, tx *sql.Tx, even
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		return sql.ErrNoRows // Kuota tidak cukup
+		return sql.ErrNoRows
 	}
 	return nil
 }
@@ -140,4 +141,57 @@ func (r *orderRepository) SaveIdempotencyKey(ctx context.Context, tx *sql.Tx, ik
 	query := `INSERT INTO idempotency_keys (key, user_id, request_hash, response_status, response_body) VALUES ($1, $2, $3, $4, $5)`
 	_, err := tx.ExecContext(ctx, query, ik.Key, ik.UserID, ik.RequestHash, ik.ResponseStatus, ik.ResponseBody)
 	return err
+}
+
+// FUNGSI BARU: GetOrders untuk List
+func (r *orderRepository) GetOrders(ctx context.Context, userID string, isAdmin bool, status, eventID string, page, limit int) ([]*model.Order, int, error) {
+	baseQuery := `FROM orders o JOIN events e ON o.event_id = e.id WHERE 1=1`
+	var args []interface{}
+	argId := 1
+
+	if !isAdmin {
+		baseQuery += fmt.Sprintf(" AND o.user_id = $%d", argId)
+		args = append(args, userID)
+		argId++
+	}
+	if status != "" {
+		baseQuery += fmt.Sprintf(" AND o.status = $%d", argId)
+		args = append(args, status)
+		argId++
+	}
+	if eventID != "" {
+		baseQuery += fmt.Sprintf(" AND o.event_id = $%d", argId)
+		args = append(args, eventID)
+		argId++
+	}
+
+	var totalItems int
+	err := r.db.QueryRowContext(ctx, "SELECT COUNT(*) "+baseQuery, args...).Scan(&totalItems)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	offset := (page - 1) * limit
+	query := fmt.Sprintf(`SELECT o.id, o.user_id, o.event_id, e.name, e.start_at, o.quantity, o.unit_price, o.total_price, o.status, o.expires_at, o.paid_at, o.cancelled_at, o.created_at, o.updated_at %s ORDER BY o.created_at DESC LIMIT $%d OFFSET $%d`, baseQuery, argId, argId+1)
+	args = append(args, limit, offset)
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var orders []*model.Order
+	for rows.Next() {
+		var o model.Order
+		var evName string
+		var evStartAt sql.NullTime
+		err := rows.Scan(&o.ID, &o.UserID, &o.EventID, &evName, &evStartAt, &o.Quantity, &o.UnitPrice, &o.TotalPrice, &o.Status, &o.ExpiresAt, &o.PaidAt, &o.CancelledAt, &o.CreatedAt, &o.UpdatedAt)
+		if err != nil {
+			return nil, 0, err
+		}
+		o.Event = &model.EventInfo{ID: o.EventID, Name: evName, StartAt: evStartAt.Time}
+		orders = append(orders, &o)
+	}
+	return orders, totalItems, nil
 }

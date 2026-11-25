@@ -59,13 +59,15 @@ func main() {
 	authMux.HandleFunc("GET /api/v1/auth/me", authHandler.Me)
 	mux.Handle("/api/v1/auth/me", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "")(authMux))
 
-	// Customer Only Routes
+	// Customer Only Routes (Or logged in)
 	customerMux := http.NewServeMux()
 	customerMux.HandleFunc("POST /api/v1/orders", orderHandler.Create)
 	customerMux.HandleFunc("POST /api/v1/orders/{id}/pay", orderHandler.Pay)
 	customerMux.HandleFunc("POST /api/v1/orders/{id}/cancel", orderHandler.Cancel)
-	mux.Handle("/api/v1/orders", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "customer")(customerMux))
-	mux.Handle("/api/v1/orders/", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "customer")(customerMux))
+	customerMux.HandleFunc("GET /api/v1/orders", orderHandler.List)
+	customerMux.HandleFunc("GET /api/v1/orders/{id}", orderHandler.Detail)
+	mux.Handle("/api/v1/orders", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "")(customerMux))
+	mux.Handle("/api/v1/orders/", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "")(customerMux))
 
 	// Admin Only Routes
 	adminMux := http.NewServeMux()
@@ -73,6 +75,8 @@ func main() {
 	adminMux.HandleFunc("PUT /api/v1/events/{id}", eventHandler.Update)
 	adminMux.HandleFunc("PATCH /api/v1/events/{id}/publish", eventHandler.Publish)
 	adminMux.HandleFunc("PATCH /api/v1/events/{id}/cancel", eventHandler.Cancel)
+	adminMux.HandleFunc("GET /api/v1/orders", orderHandler.List)        // Admin bisa akses list order
+	adminMux.HandleFunc("GET /api/v1/orders/{id}", orderHandler.Detail) // Admin bisa akses detail order
 	mux.Handle("/api/v1/events", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux))
 	mux.Handle("/api/v1/events/", middleware.AuthMiddleware([]byte(cfg.JWTSecret), "admin")(adminMux))
 

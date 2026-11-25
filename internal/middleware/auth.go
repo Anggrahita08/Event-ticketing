@@ -11,7 +11,10 @@ import (
 
 type contextKey string
 
-const UserContextKey contextKey = "user"
+const (
+	UserContextKey contextKey = "user"
+	UserRoleKey    contextKey = "role"
+)
 
 func AuthMiddleware(jwtSecret []byte, requiredRole string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -46,7 +49,6 @@ func AuthMiddleware(jwtSecret []byte, requiredRole string) func(http.Handler) ht
 				return
 			}
 
-			// Cek Role (jika endpoint khusus admin)
 			role, _ := claims["role"].(string)
 			if requiredRole != "" && role != requiredRole {
 				w.WriteHeader(http.StatusForbidden)
@@ -54,9 +56,9 @@ func AuthMiddleware(jwtSecret []byte, requiredRole string) func(http.Handler) ht
 				return
 			}
 
-			// Simpan user ID ke context
 			userID, _ := claims["sub"].(string)
 			ctx := context.WithValue(r.Context(), UserContextKey, userID)
+			ctx = context.WithValue(ctx, UserRoleKey, role)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

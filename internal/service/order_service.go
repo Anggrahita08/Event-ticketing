@@ -22,12 +22,10 @@ func NewOrderService(orderRepo repository.OrderRepository) *OrderService {
 }
 
 func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey string, req model.CreateOrderRequest) (*model.Order, bool, error) {
-	// 1. Validasi input
 	if req.Quantity < 1 || req.Quantity > 5 {
 		return nil, false, errors.New("quantity harus antara 1-5")
 	}
 
-	// Hitung hash body request untuk idempotency
 	bodyBytes, _ := json.Marshal(req)
 	hash := sha256.Sum256(bodyBytes)
 	reqHash := hex.EncodeToString(hash[:])
@@ -38,14 +36,11 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 	}
 	defer tx.Rollback()
 
-	// 2. Cek Idempotency (SELECT ... FOR UPDATE)
 	existingKey, err := s.orderRepo.GetIdempotencyKey(ctx, tx, userID, idempotencyKey)
 	if err == nil {
-		// Key sudah ada
 		if existingKey.RequestHash != reqHash {
 			return nil, false, errors.New("IDEMPOTENCY_KEY_REUSED")
 		}
-		// Body sama, kembalikan response sebelumnya
 		var prevOrder model.Order
 		json.Unmarshal(existingKey.ResponseBody, &prevOrder)
 		return &prevOrder, true, nil
@@ -53,7 +48,6 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 		return nil, false, err
 	}
 
-	// 3. Lock Event Row & Cek Status/Kuota
 	event, err := s.orderRepo.GetEventForUpdate(ctx, tx, req.EventID)
 	if err != nil {
 		return nil, false, model.ErrNotFound
@@ -66,7 +60,6 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 		return nil, false, errors.New("INVALID_STATE")
 	}
 
-	// 4. Cek Batas 5 Tiket per Customer
 	existingTickets, err := s.orderRepo.CheckUserTicketLimit(ctx, tx, userID, req.EventID)
 	if err != nil {
 		return nil, false, err
@@ -75,7 +68,6 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 		return nil, false, errors.New("TICKET_LIMIT_EXCEEDED")
 	}
 
-	// 5. Kurangi Kuota (Atomic Update)
 	err = s.orderRepo.ReduceEventQuota(ctx, tx, req.EventID, req.Quantity)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -84,7 +76,6 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 		return nil, false, err
 	}
 
-	// 6. Buat Order
 	order := &model.Order{
 		UserID:     userID,
 		EventID:    req.EventID,
@@ -100,10 +91,8 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 		return nil, false, err
 	}
 
-	// Siapkan response object
 	order.Event = &model.EventInfo{ID: event.ID, Name: event.Name, StartAt: event.StartAt}
 
-	// 7. Simpan Idempotency Key (Hanya jika sukses)
 	responseBody, _ := json.Marshal(order)
 	ik := &model.IdempotencyKey{
 		Key:            idempotencyKey,
@@ -136,7 +125,6 @@ func (s *OrderService) PayOrder(ctx context.Context, userID, orderID string) (*m
 		return nil, model.ErrNotFound
 	}
 
-	// Cek kepemilikan (jika bukan miliknya, return 404)
 	if order.UserID != userID {
 		return nil, model.ErrNotFound
 	}
@@ -176,7 +164,6 @@ func (s *OrderService) CancelOrder(ctx context.Context, userID, orderID string) 
 		return nil, errors.New("INVALID_STATE")
 	}
 
-	// Cek apakah event sudah mulai
 	event, err := s.orderRepo.GetEventForUpdate(ctx, tx, order.EventID)
 	if err != nil {
 		return nil, err
@@ -193,4 +180,28 @@ func (s *OrderService) CancelOrder(ctx context.Context, userID, orderID string) 
 	}
 
 	return s.orderRepo.FindOrderByID(ctx, orderID)
+}
+
+func (s *OrderService) GetOrders(ctx context.Context, userID string, isAdmin bool, status, eventID string, page, limit int) ([]*model.Order, int, error) {
+	if limit > 100 {
+		limit = 100
+	}
+	if limit < 1 {
+		limit = 10
+	}
+	if page < 1 {
+		page = 1
+	}
+	return s.orderRepo.GetOrders(ctx, userID, isAdmin, status, eventID, page, limit)
+}
+
+func (s *OrderService) GetOrderByID(ctx context.Context, userID string, isAdmin bool, orderID string) (*model.Order, error) {
+	order, err := s.orderRepo.FindOrderByID(ctx, orderID)
+	if err != nil {
+		return nil, model.ErrNotFound
+	}
+	if !isAdmin && order.UserID != userID {
+		return nil, model.ErrNotFound
+	}
+	return order, nil
 }

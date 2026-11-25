@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"project-ticketing-golang/internal/middleware"
 	"project-ticketing-golang/internal/model"
@@ -87,11 +88,42 @@ func (h *OrderHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 	writeSuccess(w, http.StatusOK, "Order berhasil dibatalkan", order, nil)
 }
 
-// func (h *EventHandler) ListPublic(w http.ResponseWriter, r *http.Request) {
-// 	writeSuccess(w, http.StatusOK, "Daftar event berhasil diambil", []interface{}{}, nil)
-// }
+func (h *OrderHandler) List(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value(middleware.UserContextKey).(string)
+	role, _ := r.Context().Value(middleware.UserRoleKey).(string)
+	isAdmin := role == "admin"
 
-// func (h *EventHandler) GetDetail(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	page, _ := strconv.Atoi(q.Get("page"))
+	limit, _ := strconv.Atoi(q.Get("limit"))
 
-// 	writeSuccess(w, http.StatusOK, "Detail event berhasil diambil", map[string]string{}, nil)
-// }
+	orders, totalItems, err := h.orderService.GetOrders(r.Context(), userID, isAdmin, q.Get("status"), q.Get("event_id"), page, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error(), nil)
+		return
+	}
+
+	if limit < 1 {
+		limit = 10
+	}
+	if page < 1 {
+		page = 1
+	}
+	totalPages := (totalItems + limit - 1) / limit
+	meta := map[string]interface{}{"page": page, "limit": limit, "total_items": totalItems, "total_pages": totalPages}
+	writeSuccess(w, http.StatusOK, "Daftar order berhasil diambil", orders, meta)
+}
+
+func (h *OrderHandler) Detail(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value(middleware.UserContextKey).(string)
+	role, _ := r.Context().Value(middleware.UserRoleKey).(string)
+	isAdmin := role == "admin"
+	orderID := r.PathValue("id")
+
+	order, err := h.orderService.GetOrderByID(r.Context(), userID, isAdmin, orderID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Order tidak ditemukan", nil)
+		return
+	}
+	writeSuccess(w, http.StatusOK, "Detail order berhasil diambil", order, nil)
+}
